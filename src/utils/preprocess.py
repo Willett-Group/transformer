@@ -90,7 +90,7 @@ def convert_covariates_to_numpy(year_range=range(1985, 2019), data_path='/share/
 
 def convert_ssts_to_numpy(year_range = range(1985, 2019), data_path='/share/data/willett-group/'):
     for y in year_range:
-        year = pd.read_hdf(data_path + 'sst.'+str(y)+'.h5')
+        year = pd.read_hdf('/scratch/grosenthal/sst.'+str(y)+'.h5')
         a = np.zeros((366 if y % 4 ==0 else 365,169727))
 
         days = {day : idx for idx, day in enumerate(year.index.unique(level='start_date'))}
@@ -109,7 +109,7 @@ def convert_ssts_to_numpy(year_range = range(1985, 2019), data_path='/share/data
 def concatenate_ssts(year_range = range(1985,2019), data_path='/share/data/willett_group/'):
     all_ssts = []
     for i in range(1985,2019):
-        year = pickle.load( open(data_path+'sst_as_numpy_'+str(i)+'.pkl', "rb" ) )
+        year = pickle.load( open( "/share/data/willett-group/sst_as_numpy_"+str(i)+'.pkl', "rb" ) )
         all_ssts.append(year['data'])
     all_ssts_concat = np.concatenate(all_ssts, axis=0)
     all_sst = {'data':all_ssts_concat, 'locs': year['locs']} 
@@ -166,6 +166,151 @@ def SSTPCA(year_range = range(1985, 2019), data_path='/share/data/willett-group/
     pickle.dump(pca, open(data_path + 'sst_pca_mapping.pkl', "wb"))
     pickle.dump(sst_train_pca, open(data_path + 'sst_train_pca.pkl', "wb"))    
     pickle.dump(sst_test_pca, open(data_path + 'sst_test_pca.pkl', "wb"))        
+
+def detrend(all_y, year_range = range(1985, 2019)):
+    year_lengths = [366 if i % 4 == 0 else 365 for i in year_range]
+    
+    
+    train_days = int(0.8*sum(year_lengths))
+    test_days = sum(year_lengths) - int(0.8*sum(year_lengths))
+    
+    year_indices = np.cumsum(year_lengths)
+    
+    train_indices = year_indices[year_indices <= train_days]
+    test_indices = year_indices[year_indices >= train_days]
+    
+    train_indices = np.append(train_indices, train_days)
+    test_indices = np.insert(test_indices, 0, train_indices[-1])
+
+    test_indices[-1] -= 28
+    
+    split_by_year = np.array_split(all_y[:train_days], train_indices)
+    
+    test_split_by_year = np.array_split(all_y[train_days:], (test_indices - train_days)[1:])[:-1]
+    
+    temps_by_location_by_year = np.zeros((3274, 366, 34))
+    for year in range(len(split_by_year)):
+        for day in range(len(split_by_year[year])):
+            for loc in range(len(split_by_year[year][day])):
+                temps_by_location_by_year[loc, day, year] = split_by_year[year][day, loc]
+    
+    test_temps_by_location_by_year = np.zeros((3274, 366, 34))
+    for year in range(len(test_split_by_year)):
+        for day in range(len(test_split_by_year[year])):
+            for loc in range(len(test_split_by_year[year][day])):
+                
+                real_day = year_lengths[year] + 1 - len(test_split_by_year[year]) + day if not year else day
+#                 if not year:
+#                     print('original day:' + str(day) + ', realday: ' + str(real_day))
+                test_temps_by_location_by_year[loc, real_day, year] = test_split_by_year[year][day, loc]
+    
+    means = np.zeros((3274, 366))
+    stds = np.zeros((3274, 366))
+    
+    
+    
+    from scipy import stats
+    for loc in range(len(temps_by_location_by_year)):
+        for day in range(len(temps_by_location_by_year[loc])):
+            before_replace = temps_by_location_by_year[loc, day]
+            before_replace[before_replace == 0] = np.nan
+            means[loc, day] = np.nanmean(before_replace)
+            stds[loc, day] = np.nanstd(before_replace)
+            
+            temps_by_location_by_year[loc,day] = stats.zscore(before_replace, nan_policy='omit')
+            
+            
+    for loc in range(len(test_temps_by_location_by_year)):
+        for day in range(len(test_temps_by_location_by_year[loc])):
+            before_replace = test_temps_by_location_by_year[loc, day]
+            before_replace[before_replace == 0] = np.nan
+            
+            test_temps_by_location_by_year[loc,day] = (test_temps_by_location_by_year[loc,day] - means[loc, day])/stds[loc,day]
+            
+    flipped = np.zeros((3274, 34, 366))
+
+    flipped_test = np.zeros((3274, 34, 366))
+    
+    for loc in range(len(temps_by_location_by_year)):
+        for y in range(0, 34):
+            flipped[loc, y] = temps_by_location_by_year[loc, :, y]
+            
+            
+    for loc in range(len(test_temps_by_location_by_year)):
+        for y in range(0, 34):
+            flipped_test[loc, y] = test_temps_by_location_by_year[loc, :, y]
+                 
+    all_days = np.zeros((3274, len(all_y)))
+    for loc in range(len(flipped)):
+        testloc = np.concatenate((np.concatenate(flipped[loc]), np.concatenate(flipped_test[loc])))
+        all_days[loc] = testloc[~np.isnan(testloc)]
+
+    return all_days.T, (means, stds)    
+
+def create_sequence(input_data, y_actual, train_window, flatten_sequence):  #  Create sequences of observations for training
+    seq = []
+    L = len(input_data)
+    feature_size = input_data[0].shape[0]
+    for i in range(L-train_window):
+        train_seq = np.array(input_data[i:i+train_window])
+        if flatten_sequence:
+            train_seq = np.reshape(train_seq, (-1, ))
+        train_label = np.array(y_actual[i + train_window - 1]) # get y_t+14
+        seq.append((train_seq ,train_label))
+    return seq
+
+def create_dataset_detrend( year_range = range(1985, 2019), n_comp = 100, n_sst_comp = 100, train_window=90, flatten_sequence=True, detrend_y=True, target_variable='tmp2m', average_period = 14, data_path = '/share/data/willett-group/'):
+    
+    train_normal = pickle.load( open( data_path + "land_train_pca.pkl", "rb" ) )[:,0:n_comp]
+    train_sst = pickle.load( open( data_path + "sst_train_pca.pkl", "rb" ) )[0:train_normal.shape[0], 0:n_sst_comp]   
+    
+    train_data = np.concatenate((train_normal,train_sst), axis=1)
+    
+    
+    test_normal = pickle.load( open( data_path + "land_test_pca.pkl", "rb" ) )[:-28,0:n_comp]
+    print(test_normal.shape)
+    test_sst = pickle.load( open( data_path + "sst_test_pca.pkl", "rb" ) )[0:test_normal.shape[0], 0:n_sst_comp]   
+    
+    test_data = np.concatenate((test_normal,test_sst), axis=1)
+    
+    all_x = np.concatenate((train_data, test_data))
+   
+    all_years = transpose_and_concatenate(range(1985, 2019), data_path)
+    target_vars = list(filter(lambda c: target_variable in c, all_years.columns))
+#     Forward looking rolling mean is really difficult, so I reverse all the columns, shift them forward by 14, calculate 14 day average, and then reverse them again
+    all_y = all_years[target_vars][::-1].shift(13).rolling(window=14).mean()[::-1][:-28].to_numpy()
+    all_y_detrended = []
+    means = []
+    stds = []
+    if(detrend_y):
+        all_y_detrended, (means, stds) = detrend(all_y) 
+    
+    else:
+        all_y_detrended = all_y
+    all_seq = create_sequence(all_x, all_y_detrended,train_window, flatten_sequence)
+    
+    train = all_seq[0:train_sst.shape[0]]
+    test = all_seq[train_sst.shape[0]-90:]
+    
+   
+    return (train, test), (means, stds)
+
+def dataset_to_pairs(train, test):
+    train_X = []
+    train_Y = []
+    
+    test_X = []
+    test_Y = []
+
+    for train_pair in train:
+        train_X.append(train_pair[0])
+        train_Y.append(train_pair[1])      
+        
+    for test_pair in test:
+        test_X.append(test_pair[0])
+        test_Y.append(test_pair[1])
+        
+    return (np.array(train_X), np.array(train_Y)), (np.array(test_X), np.array(test_Y))     
 
 def create_dataset( year_range = range(1985, 2019), n_comp = 100, n_sst_comp = 100, target_variable='tmp2m', average_period = 14, data_path = '/share/data/willett-group/'):
     
